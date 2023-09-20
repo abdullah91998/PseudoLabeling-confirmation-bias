@@ -4,7 +4,7 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data as data
 from torch import optim
 from torchvision import datasets, transforms
-
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import random
 import sys
@@ -24,7 +24,7 @@ from wideArchitectures import WRN28_2_wn
 
 def parse_args():
     parser = argparse.ArgumentParser(description='command for the first train')
-    parser.add_argument('--lr', type=float, default=0.1, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=100, help='Number of images in each mini-batch')
     parser.add_argument('--test_batch_size', type=int, default=100, help='Number of images in each mini-batch')
     parser.add_argument('--epoch', type=int, default=150, help='Training epoches')
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument('--reg2', type=float, default=0.4, help='Hyperparam for loss')
     parser.add_argument('--download', type=bool, default=False, help='Download dataset')
     parser.add_argument('--network', type=str, default='MT_Net', help='The backbone of the network')
-    parser.add_argument('--seed', type=int, default=1, help='Random seed (default: 1)')
+    parser.add_argument('--seed', type=int, default=501, help='Random seed (default: 1)')
     parser.add_argument('--seed_val', type=int, default=1, help='Seed for the validation split')
     parser.add_argument('--M', action='append', type=int, default=[], help="Milestones for the LR sheduler")
     parser.add_argument('--experiment_name', type=str, default = 'Proof',help='Name of the experiment (for the output files)')
@@ -48,8 +48,8 @@ def parse_args():
     parser.add_argument('--Mixup_Alpha', type=float, default=1, help='Alpha value for the beta dist from mixup')
     parser.add_argument('--cuda_dev', type=int, default=0, help='Set to 1 to choose the second gpu')
     parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset name')
-    parser.add_argument('--swa', type=str, default='True', help='Apply SWA')
-    parser.add_argument('--swa_start', type=int, default=350, help='Start SWA')
+    parser.add_argument('--swa', type=str, default='False', help='Apply SWA')
+    parser.add_argument('--swa_start', type=int, default=100, help='Start SWA')
     parser.add_argument('--swa_freq', type=float, default=5, help='Frequency')
     parser.add_argument('--swa_lr', type=float, default=-0.01, help='LR')
     parser.add_argument('--labeled_batch_size', default=16, type=int, metavar='N', help="Labeled examples per minibatch (default: no constrain)")
@@ -101,8 +101,9 @@ def main(args):
 
     #####################
     # Initializing seeds and preparing GPU
-    if args.cuda_dev == 1:
-        torch.cuda.set_device(1)
+    #if args.cuda_dev == 1:
+    #    torch.cuda.set_device(1)
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.deterministic = True  # fix the GPU to deterministic mode
     torch.manual_seed(args.seed)  # CPU seed
@@ -188,8 +189,8 @@ def main(args):
     acc_train_per_epoch = []
     acc_val_per_epoch = []
 
-    exp_path = os.path.join('./', 'ssl_models_{0}'.format(args.experiment_name), str(args.labeled_samples))
-    res_path = os.path.join('./', 'metrics_{0}'.format(args.experiment_name), str(args.labeled_samples))
+    exp_path = os.path.join('./', 'ssl_models_{0}'.format(args.experiment_name), str(args.labeled_samples), 'trades_attack_wrn_seed_{0}'.format(args.seed))
+    res_path = os.path.join('./', 'metrics_{0}'.format(args.experiment_name), str(args.labeled_samples), 'trades_attack_wrn_seed_{0}'.format(args.seed))
 
     if not os.path.isdir(res_path):
         os.makedirs(res_path)
@@ -219,7 +220,7 @@ def main(args):
             train_type = train_type + 'drop' + str(int(10*args.dropout))
         if args.reg2 == 0.0:
             train_type = train_type + 'noReg'
-        path = './checkpoints/warmUp_{0}_{1}_{2}_{3}_{4}_{5}_S{6}.hdf5'.format(train_type, \
+        path = './checkpoints/trades/mixup/warmUp_{0}_{1}_{2}_{3}_{4}_{5}_S{6}.hdf5'.format(train_type, \
                                                                                 args.Mixup_Alpha, \
                                                                                 load_epoch, \
                                                                                 args.dataset, \
@@ -250,6 +251,8 @@ def main(args):
     ####################################################################################################
     ###############################               TRAINING                ##############################
     ####################################################################################################    
+    if args.dataset_type == 'ssl_warmUp':
+        writer = SummaryWriter("runs/mix_up/trades/trades_mixup_50k_511")
 
     for epoch in range(1, args.epoch + 1):
         st = time.time()
@@ -273,18 +276,25 @@ def main(args):
         else:
             loss_per_epoch_test, acc_val_per_epoch_i = testing(args, model, device, test_loader)
 
+        if args.dataset_type == 'ssl_warmUp':
+            writer.add_scalar('trades_mixup_Loss/test', np.array(loss_per_epoch_test), epoch)
+            writer.add_scalar('trades_mixup_accuracy/test', np.array(acc_val_per_epoch_i), epoch)
+
         loss_val_epoch += loss_per_epoch_test
         acc_train_per_epoch += [top1_train_ac]
         acc_val_per_epoch += acc_val_per_epoch_i
 
+
+        #writer.add_scalar('Loss/test', torch.tensor(loss_val_epoch), epoch)
+        #writer.add_scalar('accuracy/test', torch.tensor(acc_val_per_epoch), epoch)
 
 
         ####################################################################################################
         #############################               SAVING MODELS                ###########################
         ####################################################################################################
 
-        if not os.path.exists('./checkpoints'):
-            os.mkdir('./checkpoints')
+        if not os.path.exists('./checkpoints/trades/mixup'):
+            os.mkdir('./checkpoints/trades/mixup')
 
         if epoch == 1:
             best_acc_val = acc_val_per_epoch_i[-1]
@@ -337,7 +347,7 @@ def main(args):
 
         if cond and save:
             print("Saving models...")
-            path = './checkpoints/{0}_{1}_{2}_{3}_{4}_S{5}.hdf5'.format(name, epoch, args.dataset, \
+            path = './checkpoints/trades/mixup/{0}_{1}_{2}_{3}_{4}_S{5}.hdf5'.format(name, epoch, args.dataset, \
                                                                         args.labeled_samples, \
                                                                         args.network, \
                                                                         args.seed)
@@ -368,6 +378,9 @@ def main(args):
         # save accuracies:
         np.save(res_path + '/' + str(args.labeled_samples) + '_accuracy_per_epoch_train.npy',np.asarray(acc_train_per_epoch))
         np.save(res_path + '/' + str(args.labeled_samples) + '_accuracy_per_epoch_val.npy', np.asarray(acc_val_per_epoch))
+
+    if args.dataset_type == 'ssl_warmUp':
+        writer.close()
 
     # applying swa
     if args.swa == 'True':
