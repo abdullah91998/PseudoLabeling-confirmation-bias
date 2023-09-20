@@ -18,7 +18,143 @@ from sklearn import preprocessing as preprocessing
 import sys
 from math import pi
 from math import cos
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+import torch.optim as optim
 
+
+
+
+def fgsm(model, X, y, epsilon):
+    """ Construct FGSM adversarial examples on the examples X"""
+    delta = torch.zeros_like(X, requires_grad=True)
+    loss = nn.CrossEntropyLoss()(model(X + delta), y)
+    loss.backward()
+    return epsilon * delta.grad.detach().sign()
+
+def pgd_linf(model, X, y, epsilon=0.031, alpha=0.01, num_iter=10, randomize=False):
+    """ Construct FGSM adversarial examples on the examples X"""
+    if randomize:
+        delta = torch.rand_like(X, requires_grad=True)
+        delta.data = delta.data * 2 * epsilon - epsilon
+    else:
+        delta = torch.zeros_like(X, requires_grad=True)
+        
+    for t in range(num_iter):
+        with torch.enable_grad():
+            loss = nn.CrossEntropyLoss()(model(X + delta), y)
+        loss.backward()
+        delta.data = (delta + alpha*delta.grad.detach().sign()).clamp(-epsilon,epsilon)
+        delta.grad.zero_()
+    return delta.detach()
+
+def pgd(model,
+        X,
+        y,
+        epsilon=8 / 255,
+        num_steps=20,
+        step_size=0.01,
+        random_start=True):
+    out = model(X)
+    is_correct_natural = (out.max(1)[1] == y).float().cpu().numpy()
+    perturbation = torch.zeros_like(X, requires_grad=True)
+
+    if random_start:
+        perturbation = torch.rand_like(X, requires_grad=True)
+        perturbation.data = perturbation.data * 2 * epsilon - epsilon
+
+    is_correct_adv = []
+    opt = optim.SGD([perturbation], lr=1e-3)  # This is just to clear the grad
+
+    for _ in range(num_steps):
+        opt.zero_grad()
+
+        with torch.enable_grad():
+            loss = nn.CrossEntropyLoss()(model(X + perturbation), y)
+
+        loss.backward()
+
+        perturbation.data = (
+            perturbation + step_size * perturbation.grad.detach().sign()).clamp(
+            -epsilon, epsilon)
+        perturbation.data = torch.min(torch.max(perturbation.detach(), -X),
+                                      1 - X)  # clip X+delta to [0,1]
+        X_pgd = Variable(torch.clamp(X.data + perturbation.data, 0, 1.0),
+                         requires_grad=False)
+        
+    return X_pgd
+
+
+def trades_loss(model,
+                x_natural,
+                y,
+                optimizer,
+                step_size=0.003,
+                epsilon=0.031,
+                perturb_steps=10,
+                beta=1.0,
+                distance='l_inf'):
+    # define KL-loss
+    criterion_kl = nn.KLDivLoss(reduction='sum')
+    model.eval()
+    batch_size = len(x_natural)
+    # generate adversarial example
+    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).cuda().detach()
+    if distance == 'l_inf':
+        for _ in range(perturb_steps):
+            x_adv.requires_grad_()
+            with torch.enable_grad():
+                loss_kl = criterion_kl(F.log_softmax(model(x_adv), dim=1),
+                                       F.softmax(model(x_natural), dim=1))
+            grad = torch.autograd.grad(loss_kl, [x_adv])[0]
+            x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
+            x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
+            x_adv = torch.clamp(x_adv, 0.0, 1.0)
+    elif distance == 'l_2':
+        delta = 0.001 * torch.randn(x_natural.shape).cuda().detach()
+        delta = Variable(delta.data, requires_grad=True)
+
+        # Setup optimizers
+        optimizer_delta = optim.SGD([delta], lr=epsilon / perturb_steps * 2)
+
+        for _ in range(perturb_steps):
+            adv = x_natural + delta
+
+            # optimize
+            optimizer_delta.zero_grad()
+            with torch.enable_grad():
+                loss = (-1) * criterion_kl(F.log_softmax(model(adv), dim=1),
+                                           F.softmax(model(x_natural), dim=1))
+            loss.backward()
+            # renorming gradient
+            grad_norms = delta.grad.view(batch_size, -1).norm(p=2, dim=1)
+            delta.grad.div_(grad_norms.view(-1, 1, 1, 1))
+            # avoid nan or inf if gradient is 0
+            if (grad_norms == 0).any():
+                delta.grad[grad_norms == 0] = torch.randn_like(delta.grad[grad_norms == 0])
+            optimizer_delta.step()
+
+            # projection
+            delta.data.add_(x_natural)
+            delta.data.clamp_(0, 1).sub_(x_natural)
+            delta.data.renorm_(p=2, dim=0, maxnorm=epsilon)
+        x_adv = Variable(x_natural + delta, requires_grad=False)
+    else:
+        x_adv = torch.clamp(x_adv, 0.0, 1.0)
+    model.train()
+
+    x_adv = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
+    # zero gradient
+    optimizer.zero_grad()
+    # calculate robust loss
+    logits = model(x_natural)
+    loss_natural = F.cross_entropy(logits, y)
+    loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(model(x_adv), dim=1),
+                                                    F.softmax(model(x_natural), dim=1))
+    loss = loss_natural + beta * loss_robust
+    return loss
 ##############################################################################
 ############################# TRAINING LOSSSES ###############################
 ##############################################################################
@@ -117,6 +253,18 @@ def train_CrossEntropy(args, model, device, train_loader, optimizer, epoch, unla
 
             if args.DApseudolab == "False":
                 optimizer.zero_grad()
+                
+                #delta = pgd_linf(model, images_pslab, labels, epsilon=0.1, alpha=0.01, num_iter=20, randomize=False)
+                """
+                delta = trades_loss(model=model,
+                           x_natural=images_pslab,
+                           y=labels,
+                           optimizer=optimizer,
+                           step_size=0.003,
+                           epsilon=0.031,
+                           perturb_steps=10,
+                           beta=6.0)
+                """
                 output_x1 = model(images_pslab)
                 output_x1.detach_()
                 optimizer.zero_grad()
@@ -139,24 +287,41 @@ def train_CrossEntropy(args, model, device, train_loader, optimizer, epoch, unla
 
             images, targets_a, targets_b, lam = mixup_data(images, soft_labels, alpha, device)
 
-        # compute output
+        #fgsm attack
+        
+        loss_trades = trades_loss(model=model,
+                           x_natural=images,
+                           y=labels,
+                           optimizer=optimizer,
+                           step_size=0.003,
+                           epsilon=0.031,
+                           perturb_steps=10,
+                           beta=6.0)
+        #delta = pgd_linf(model, images, labels, epsilon=0.1, alpha=0.01, num_iter=20, randomize=False)
+        
         outputs = model(images)
+        
+        # compute output
+        #outputs = model(images)
 
         if args.loss_term == "Reg_ep":
-            prob, loss = loss_soft_reg_ep(outputs, labels, soft_labels, device, args)
+            prob, loss_reg = loss_soft_reg_ep(outputs, labels, soft_labels, device, args)
 
         elif args.loss_term == "MixUp_ep":
             prob = F.softmax(output_x1, dim=1)
-            prob_mixup, loss = loss_mixup_reg_ep(outputs, labels, targets_a, targets_b, device, lam, args)
+            prob_mixup, loss_reg = loss_mixup_reg_ep(outputs, labels, targets_a, targets_b, device, lam, args)
             outputs = output_x1
 
         results[index.detach().numpy().tolist()] = prob.cpu().detach().numpy().tolist()
-
+        
+        loss=loss_trades+loss_reg
+        
         prec1, prec5 = accuracy_v2(outputs, labels, top=[1, 1])
         train_loss.update(loss.item(), images.size(0))
         top1.update(prec1.item(), images.size(0))
         top5.update(prec5.item(), images.size(0))
-
+        
+        
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
@@ -184,7 +349,6 @@ def train_CrossEntropy(args, model, device, train_loader, optimizer, epoch, unla
 
 ###################################################################################
 
-
 def testing(args, model, device, test_loader):
     model.eval()
     loss_per_batch = []
@@ -194,7 +358,9 @@ def testing(args, model, device, test_loader):
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(test_loader):
             data, target = data.to(device), target.to(device)
-            output = model(data)
+            adv_x = pgd(model, data, target, epsilon=0.03, num_steps=20, step_size=0.007, random_start=False)
+            
+            output = model(adv_x)
             output = F.log_softmax(output, dim=1)
             test_loss += F.nll_loss(output, target, reduction='sum').item()
             loss_per_batch.append(F.nll_loss(output, target).item())
@@ -212,6 +378,43 @@ def testing(args, model, device, test_loader):
 
     return (loss_per_epoch, acc_val_per_epoch)
 
+"""
+def testing(args, model, device, test_loader):
+    model.eval()
+    loss_per_batch = []
+    acc_val_per_batch =[]
+    test_loss = 0
+    correct = 0
+    with torch.enable_grad():
+        for batch_idx, (data, target) in enumerate(test_loader):
+            data, target = data.to(device), target.to(device)
+            delta = torch.zeros_like(data, requires_grad=True)
+            output=model(data+delta)
+            output = F.log_softmax(output, dim=1)
+            #loss = nn.CrossEntropyLoss()(model(data + delta.detach()), target)
+            loss = F.nll_loss(output,target, reduction='sum')
+            loss.backward(retain_graph=True)
+            delta_grad=delta.grad.detach()
+            delta = 0.1 * delta_grad.sign()
+            output = model(data+delta)
+            output = F.log_softmax(output, dim=1)
+            test_loss += F.nll_loss(output, target, reduction='sum').item()
+            loss_per_batch.append(F.nll_loss(output, target).item())
+            pred = output.max(1, keepdim=True)[1] # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            acc_val_per_batch.append(100. * correct / ((batch_idx+1)*args.test_batch_size))
+            delta_grad.zero_()
+
+    test_loss /= len(test_loader.dataset)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_val_per_epoch = [np.array(100. * correct / len(test_loader.dataset))]
+
+    return (loss_per_epoch, acc_val_per_epoch)
+"""
 
 def validating(args, model, device, test_loader):
     model.eval()
