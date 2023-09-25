@@ -1,4 +1,4 @@
-# Pseudo-Labeling and Confirmation Bias in Robust Deep Semi-Supervised Learning (2019)
+# Pseudo-Labeling and Confirmation Bias in Robust Deep Semi-Supervised Learning
 ### Paper: https://arxiv.org/abs/1908.02983
 
 
